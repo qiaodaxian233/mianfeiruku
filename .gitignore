@@ -3,3 +3,4 @@ __pycache__/
 steam_free_finder_data.json
 *.csv
 .venv/
+debug_report.txt

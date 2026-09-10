@@ -17,7 +17,8 @@
 | 文件 | 作用 |
 |---|---|
 | `steam_free_finder.py` | 全部代码。`SteamClient` 负责网络与解析，`App` 负责界面 |
-| `requirements.txt` | requests、beautifulsoup4、pillow（可选） |
+| `debug_network.py` | 网络诊断工具（Tk 窗口/命令行），逐项检查并给出结论，报告存 `debug_report.txt` |
+| `requirements.txt` | requests、beautifulsoup4；可选 pillow / truststore / pysocks |
 | `run.bat` / `run.sh` | 一键安装依赖并启动 |
 | `README.md` | 使用说明（含加速器/代理问题的处理） |
 | `MEMORY.md` | 本文件 |
@@ -42,18 +43,26 @@
    识别 Chromium 错误页（`class="neterror"` + `ERR_*`）视为失败。使用独立 `--user-data-dir`（临时目录）避免和正在运行的浏览器冲突。
    之所以能用：雷神等加速器的进程模式只放行 Steam 和浏览器进程，无头浏览器同样是 msedge.exe/chrome.exe。
    自动模式顺序：直连 → 系统代理 → 自定义 → 浏览器；成功的线路写入设置 `last_route`，下次优先尝试。浏览器线路下不加载封面图。
-7. **不做的事**：不自动点击「添加至账户」（需要用户登录凭证，不安全）；不抓 SteamDB（有 Cloudflare 且违反其 ToS）。
+7. **网络诊断（v1.3 新增）** `debug_network.py`：环境 → 代理设置（env / urllib / 注册表 ProxyServer+AutoConfigURL(PAC) / netsh winhttp）
+   → DNS（getaddrinfo、阿里 DoH 参考、hosts、nslookup）→ 每个 IP 的 TCP+TLS（用系统证书库）→ requests 直连与候选代理
+   → netstat/tasklist 列出监听端口与进程，疑似加速器进程端口 + 常见代理端口逐个当 HTTP(/SOCKS5) 代理试
+   → curl 与无头 Edge/Chrome 对比 → 进程/虚拟网卡/默认路由痕迹 → 结论（进程模式 / 找到可用代理 / 证书中间人 / IPv6 / DNS）。
+   主程序右上角「网络诊断」按钮用 `subprocess.Popen([sys.executable, debug_network.py])` 启动它。
+   主程序可选 `truststore.inject_into_ssl()`（已安装才生效）。
+8. **不做的事**：不自动点击「添加至账户」（需要用户登录凭证，不安全）；不抓 SteamDB（有 Cloudflare 且违反其 ToS）。
 
 ## 版本记录
 
 - **v1.0（2026-09-10）** 初版：扫描、好评数据、三种分类、排序过滤、新品提醒、已领取标记、导出 CSV、封面显示。
 - **v1.1（2026-09-10）** 修复开着加速器时 `ProxyError … SSLEOFError` 无法连接：新增网络线路自动切换与代理设置；工具栏拆成两行；错误弹窗列出每条线路的失败原因与建议。
+- **v1.3（2026-09-10）** 用户反馈"浏览器能开商店但软件不行、不知道哪出问题"。新增 `debug_network.py` 网络诊断工具 + 主程序「网络诊断」按钮；主程序支持可选 truststore。
 - **v1.2（2026-09-10）** 用户用雷神加速器（AI 智能模式）仍报「直连：连接超时」——加速器只给浏览器/Steam 进程加速。新增「浏览器」线路（Edge/Chrome 无头抓取），自动模式兜底到它；记住上次成功线路；错误提示改为建议切「路由模式」或选「浏览器」。
 
 ## 当前状态
 
 - 代码在无网络的沙盒中完成了：语法检查、搜索页解析单元测试（中/英文评测提示、新旧价格标签）、线路切换模拟测试、Tkinter 界面无头截图检查。
 - 用户环境：Windows + 雷神加速器（Steam商店|社区，中国港服商店，AI 智能模式）。v1.0 报 ProxyError（当时有系统代理），v1.1 报「直连：连接超时」（无系统代理、加速器只放行浏览器）。
+- **等待用户运行「网络诊断」并回传 debug_report.txt**，据此判断是进程模式 / 本地代理端口 / PAC / 证书中间人 / IPv6 中的哪一种。
 - **v1.2 的浏览器线路尚未在用户真实环境验证**；沙盒里用假浏览器脚本验证了参数、JSON 提取、错误页识别和自动兜底。等待用户反馈。
 - 若浏览器线路也失败，看弹窗里浏览器那行的原因：「未找到 Edge/Chrome」→ 路径问题；「打不开页面（ERR_…）」→ 无头浏览器没被加速器放行，改用雷神路由模式；「超时」→ 加大 `fetch_dom` 的 timeout 或检查是否弹出了首次运行界面。
 

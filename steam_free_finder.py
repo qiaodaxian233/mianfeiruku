@@ -18,7 +18,8 @@ Steam 免费入库雷达 · Steam Free-to-Keep Finder
   「浏览器」线路用本机 Edge/Chrome 无头模式抓取，专治雷神/UU 等加速器只给浏览器加速的情况；
   自动修正 Windows 系统代理的 https:// 前缀问题；记住上次成功的线路
 
-版本：1.2（2026-09-10）
+版本：1.3（2026-09-10）
+- 右上角「网络诊断」按钮：运行 debug_network.py 逐项排查连不上的原因
 
 依赖
     pip install requests beautifulsoup4
@@ -75,6 +76,13 @@ try:
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
+
+try:  # 可选：让 requests 使用系统证书库（加速器/安全软件做 HTTPS 中间人时需要）
+    import truststore  # type: ignore
+
+    truststore.inject_into_ssl()
+except Exception:  # noqa: BLE001
+    pass
 
 
 # ─────────────────────────────── 常量 ────────────────────────────────
@@ -669,6 +677,7 @@ class App(tk.Tk):
         ttk.Checkbutton(bar, text="发现新免费时弹窗提醒", variable=self.var_popup).pack(side="left", padx=(12, 0))
         ttk.Button(bar, text="导出 CSV", command=self.export_csv).pack(side="right")
         ttk.Button(bar, text="打开全部未领取", command=self.open_all_unclaimed).pack(side="right", padx=(0, 6))
+        ttk.Button(bar, text="网络诊断", command=self.run_diagnostics).pack(side="right", padx=(0, 6))
 
         # ── 第二行：地区 & 网络 ──
         sb2 = ttk.Frame(self, padding=(10, 4, 10, 2))
@@ -1254,6 +1263,21 @@ class App(tk.Tk):
                 self.after(250, step)
 
         step()
+
+    def run_diagnostics(self) -> None:
+        """启动独立的网络诊断工具（debug_network.py）。"""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_network.py")
+        if not os.path.isfile(path):
+            messagebox.showerror(APP_NAME, "找不到 debug_network.py，请把它和本程序放在同一目录。")
+            return
+        try:
+            kw = {}
+            if sys.platform.startswith("win"):
+                kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.Popen([sys.executable, path], **kw)
+            self.var_status.set("网络诊断已在新窗口打开，完成后点「复制报告」发给 Claude。")
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"无法启动诊断工具：{e}")
 
     def export_csv(self) -> None:
         if not self.items:

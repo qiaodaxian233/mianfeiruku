@@ -1,3 +1,5 @@
 requests>=2.28
 beautifulsoup4>=4.12
-pillow>=9.0   # 可选：显示游戏封面；删掉这行也能正常运行
+pillow>=9.0      # 可选：显示游戏封面
+truststore>=0.9  # 可选：加速器/安全软件做 HTTPS 中间人时，让 requests 使用系统证书库
+pysocks>=1.7     # 可选：诊断/使用 SOCKS 代理
