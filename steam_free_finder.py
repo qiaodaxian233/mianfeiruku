@@ -18,7 +18,8 @@ Steam 免费入库雷达 · Steam Free-to-Keep Finder
   「浏览器」线路用本机 Edge/Chrome 无头模式抓取，专治雷神/UU 等加速器只给浏览器加速的情况；
   自动修正 Windows 系统代理的 https:// 前缀问题；记住上次成功的线路
 
-版本：1.3（2026-09-10）
+版本：1.4（2026-09-10）
+- 浏览器线路：默认浏览器优先、可手动指定、记住能用的那个；扫描时显示正在尝试的线路
 - 右上角「网络诊断」按钮：运行 debug_network.py 逐项排查连不上的原因
 
 依赖
@@ -221,9 +222,29 @@ class BrowserFetcher:
     Python 进程连不上 Steam 商店；借浏览器抓取就能走加速器的通道。无需 selenium / 驱动。
     """
 
-    def __init__(self, browsers: list[str] | None = None):
+    def __init__(self, browsers: list[str] | None = None, preferred: str = ""):
         self.browsers = browsers if browsers is not None else self.find_browsers()
+        if preferred and preferred in self.browsers:  # 上次能用的浏览器优先
+            self.browsers = [preferred] + [b for b in self.browsers if b != preferred]
         self.profile_dir = os.path.join(tempfile.gettempdir(), "steam_free_finder_browser_profile")
+
+    @staticmethod
+    def default_browser_hint() -> str:
+        """Windows 默认浏览器（加速器通常只放行它）：返回 'chrome' / 'msedge' / '' 。"""
+        if not sys.platform.startswith("win"):
+            return ""
+        try:
+            import winreg  # type: ignore
+            key = r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+                progid = str(winreg.QueryValueEx(k, "ProgId")[0]).lower()
+            if "chrome" in progid:
+                return "chrome"
+            if "edge" in progid:
+                return "msedge"
+        except OSError:
+            pass
+        return ""
 
     @staticmethod
     def find_browsers() -> list[str]:
@@ -261,6 +282,9 @@ class BrowserFetcher:
         for p in found:
             if p and os.path.isfile(p) and p not in uniq:
                 uniq.append(p)
+        hint = BrowserFetcher.default_browser_hint()
+        if hint:  # 默认浏览器排最前
+            uniq.sort(key=lambda p: 0 if hint in os.path.basename(p).lower() else 1)
         return uniq
 
     @property
@@ -283,6 +307,8 @@ class BrowserFetcher:
                     cp = subprocess.run(args, capture_output=True, timeout=timeout, **kw)
                 except subprocess.TimeoutExpired:
                     errors.append(f"{name} 超时")
+                    if len(self.browsers) > 1:  # 这个浏览器没被加速器放行，本次不再用它
+                        self.browsers = [b for b in self.browsers if b != exe]
                     break
                 except OSError as e:
                     errors.append(f"{name}：{e}")
@@ -342,10 +368,12 @@ class SteamClient:
     PROXY_MODES = ("自动", "直连", "系统代理", "自定义", "浏览器")
 
     def __init__(self, cc: str = "cn", lang: str = "schinese", proxy_mode: str = "自动",
-                 proxy_url: str = "", preferred_route: str = "", timeout=(8, 25)):
+                 proxy_url: str = "", preferred_route: str = "", preferred_browser: str = "",
+                 on_status=None, timeout=(8, 25)):
         self.cc = cc
         self.lang = lang
         self.timeout = timeout
+        self.on_status = on_status  # 线路切换时通知界面
         self.session = requests.Session()
         # 不让 requests 自动读系统代理，由下面的“线路候选”统一控制
         self.session.trust_env = False
@@ -361,7 +389,7 @@ class SteamClient:
             "mature_content": "1",
             "Steam_Language": lang,
         })
-        self.browser = BrowserFetcher()
+        self.browser = BrowserFetcher(preferred=preferred_browser)
         self._candidates = self._build_routes(proxy_mode, proxy_url, preferred_route)
         self._route_idx = 0
         self._route_locked = False
@@ -370,6 +398,10 @@ class SteamClient:
     @property
     def route_kind(self) -> str:
         return self._candidates[self._route_idx][1]
+
+    @property
+    def working_browser(self) -> str:
+        return self.browser.browsers[0] if self.browser.browsers else ""
 
     def _build_routes(self, mode: str, custom: str, preferred: str) -> list[tuple[str, str, dict]]:
         """返回 [(线路名称, 类型 http|browser, proxies), …]，按尝试顺序排列。"""
@@ -410,7 +442,11 @@ class SteamClient:
         errors: list[str] = []
         for idx, (desc, kind, proxies) in routes:
             last_err: Exception | None = None
-            attempts = 1 if kind == "browser" else retries
+            # 浏览器线路只试一次；自动模式探路阶段其他线路也只试一次，尽快切换
+            attempts = 1 if (kind == "browser" or (len(routes) > 1 and not self._route_locked)) else retries
+            if len(routes) > 1 and self.on_status:
+                nxt = "，失败后自动切换下一条" if idx < len(self._candidates) - 1 else ""
+                self.on_status(f"正在尝试线路：{desc}{nxt}…")
             for attempt in range(attempts):
                 try:
                     if kind == "browser":
@@ -700,8 +736,16 @@ class App(tk.Tk):
         ent_proxy = ttk.Entry(sb2, textvariable=self.var_proxy_url, width=24)
         ent_proxy.pack(side="left", padx=(4, 0))
         ent_proxy.bind("<Return>", lambda e: self.refresh())
-        ttk.Label(sb2, text="开着加速器时：把加速器切到「路由模式」，或网络选「浏览器」（借 Edge/Chrome 抓取）",
-                  foreground="#888888").pack(side="left", padx=(6, 0))
+        ttk.Label(sb2, text="浏览器").pack(side="left", padx=(10, 0))
+        self._browser_paths = BrowserFetcher.find_browsers()
+        names = ["自动"] + [os.path.basename(p) for p in self._browser_paths]
+        saved_exe = s.get("browser_exe", "")
+        self.var_browser = tk.StringVar(
+            value=os.path.basename(saved_exe) if saved_exe in self._browser_paths else "自动")
+        ttk.Combobox(sb2, textvariable=self.var_browser, values=names, width=11, state="readonly").pack(
+            side="left", padx=(4, 0))
+        ttk.Label(sb2, text="开着雷神/UU 等加速器时：网络选「浏览器」（默认浏览器通常被放行）",
+                  foreground="#888888").pack(side="left", padx=(8, 0))
 
         # ── 过滤栏 ──
         fb = ttk.Frame(self, padding=(10, 4, 10, 6))
@@ -823,10 +867,16 @@ class App(tk.Tk):
             return
         self._manual = manual
         self._stop.clear()
+        chosen = self.var_browser.get()
+        preferred_browser = next((p for p in self._browser_paths if os.path.basename(p) == chosen), "")
+        if not preferred_browser:
+            preferred_browser = self.state_data["settings"].get("browser_exe", "")
         client = SteamClient(cc=self.var_cc.get() or "cn",
                              proxy_mode=self.var_proxy_mode.get() or "自动",
                              proxy_url=self.var_proxy_url.get(),
-                             preferred_route=self.state_data["settings"].get("last_route", ""))
+                             preferred_route=self.state_data["settings"].get("last_route", ""),
+                             preferred_browser=preferred_browser,
+                             on_status=lambda msg: self._ui(self.var_status.set, msg))
         self.client = client
         self.btn_refresh.configure(state="disabled")
         self.btn_stop.configure(state="normal")
@@ -919,6 +969,8 @@ class App(tk.Tk):
         self.state_data["seen"] = self.seen
         if self.client:
             self.state_data.setdefault("settings", {})["last_route"] = self.client.route_desc
+            if self.client.route_kind == "browser" and self.client.working_browser:
+                self.state_data["settings"]["browser_exe"] = self.client.working_browser
         save_state(self.state_data)
 
         self.items = results or []
@@ -926,6 +978,8 @@ class App(tk.Tk):
         self.var_last.set(f"上次更新 {now:%m-%d %H:%M}")
 
         route = f"　线路：{self.client.route_desc}" if self.client else ""
+        if self.client and self.client.route_kind == "browser" and self.client.working_browser:
+            route += f"（{os.path.basename(self.client.working_browser)}）"
         if not self.items:
             self.var_status.set("当前 Steam 没有正在进行的免费入库活动（100% 折扣）。稍后会自动再次检查。" + route)
         else:
@@ -1311,6 +1365,7 @@ class App(tk.Tk):
     def _on_close(self) -> None:
         self.state_data["settings"] = {
             "last_route": self.state_data.get("settings", {}).get("last_route", ""),
+            "browser_exe": self.state_data.get("settings", {}).get("browser_exe", ""),
             "cc": self.var_cc.get(), "auto": self.var_auto.get(),
             "interval": self._int(self.var_interval, 30), "popup": self.var_popup.get(),
             "group": self.var_group.get(),
