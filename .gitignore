@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+steam_free_finder_data.json
+*.csv
+.venv/
