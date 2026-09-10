@@ -14,10 +14,11 @@ Steam 免费入库雷达 · Steam Free-to-Keep Finder
 - 发现新的免费入库时高亮 + 响铃 + 弹窗提醒
 - 双击打开商店页；右键：Steam 客户端打开 / 复制链接 / 标记已领取
 - 导出 CSV；已领取记录、设置自动保存在同目录的 steam_free_finder_data.json
-- 网络线路：自动（直连 → 系统代理 → 自定义代理）/ 直连 / 系统代理 / 自定义，
-  兼容开着加速器、VPN 的情况；自动修正 Windows 系统代理的 https:// 前缀问题
+- 网络线路：自动（直连 → 系统代理 → 自定义代理 → 浏览器）/ 直连 / 系统代理 / 自定义 / 浏览器。
+  「浏览器」线路用本机 Edge/Chrome 无头模式抓取，专治雷神/UU 等加速器只给浏览器加速的情况；
+  自动修正 Windows 系统代理的 https:// 前缀问题；记住上次成功的线路
 
-版本：1.1（2026-09-10）
+版本：1.2（2026-09-10）
 
 依赖
     pip install requests beautifulsoup4
@@ -29,12 +30,15 @@ Steam 免费入库雷达 · Steam Free-to-Keep Finder
 from __future__ import annotations
 
 import csv
+import html as html_mod
 import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -200,6 +204,124 @@ def short_error(e: Exception) -> str:
     return s if len(s) <= 120 else s[:117] + "…"
 
 
+# ─────────────────────────────── 浏览器线路 ────────────────────────────────
+
+class BrowserFetcher:
+    """用本机 Edge / Chrome 的无头模式抓取页面（--dump-dom）。
+
+    游戏加速器（雷神、UU 等）的“进程模式”只给 Steam 客户端和浏览器加速，
+    Python 进程连不上 Steam 商店；借浏览器抓取就能走加速器的通道。无需 selenium / 驱动。
+    """
+
+    def __init__(self, browsers: list[str] | None = None):
+        self.browsers = browsers if browsers is not None else self.find_browsers()
+        self.profile_dir = os.path.join(tempfile.gettempdir(), "steam_free_finder_browser_profile")
+
+    @staticmethod
+    def find_browsers() -> list[str]:
+        found: list[str] = []
+        if sys.platform.startswith("win"):
+            bases = [os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                     os.environ.get("LocalAppData", "")]
+            rel = [r"Microsoft\Edge\Application\msedge.exe", r"Google\Chrome\Application\chrome.exe"]
+            for b in bases:
+                if b:
+                    found += [os.path.join(b, r) for r in rel]
+            try:
+                import winreg  # type: ignore
+                for exe in ("msedge.exe", "chrome.exe"):
+                    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                        try:
+                            key = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}"
+                            with winreg.OpenKey(root, key) as k:
+                                found.append(winreg.QueryValue(k, None))
+                        except OSError:
+                            pass
+            except ImportError:
+                pass
+        elif sys.platform == "darwin":
+            found = ["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+        else:
+            for n in ("microsoft-edge", "microsoft-edge-stable", "google-chrome", "google-chrome-stable",
+                      "chromium", "chromium-browser"):
+                p = shutil.which(n)
+                if p:
+                    found.append(p)
+        uniq: list[str] = []
+        for p in found:
+            if p and os.path.isfile(p) and p not in uniq:
+                uniq.append(p)
+        return uniq
+
+    @property
+    def available(self) -> bool:
+        return bool(self.browsers)
+
+    def fetch_dom(self, url: str, timeout: int = 45) -> str:
+        errors: list[str] = []
+        for exe in list(self.browsers):
+            name = os.path.basename(exe)
+            for headless_flag in ("--headless=new", "--headless"):
+                args = [exe, headless_flag, "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+                        "--disable-extensions", "--disable-sync", "--disable-background-networking",
+                        "--log-level=3", "--window-size=1280,800",
+                        f"--user-data-dir={self.profile_dir}", "--dump-dom", url]
+                kw = {}
+                if sys.platform.startswith("win"):
+                    kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                try:
+                    cp = subprocess.run(args, capture_output=True, timeout=timeout, **kw)
+                except subprocess.TimeoutExpired:
+                    errors.append(f"{name} 超时")
+                    break
+                except OSError as e:
+                    errors.append(f"{name}：{e}")
+                    break
+                dom = cp.stdout.decode("utf-8", "replace")
+                if not dom.strip():
+                    errors.append(f"{name} 无输出")
+                    continue  # 换旧版 --headless 再试一次
+                err = re.search(r"\b(ERR_[A-Z_]+)\b", dom)
+                if err and re.search(r'class="[^"]*neterror|main-frame-error', dom):
+                    errors.append(f"{name} 打不开页面（{err.group(1)}）")
+                    break
+                # 记住能用的浏览器，下次直接用
+                self.browsers = [exe] + [b for b in self.browsers if b != exe]
+                return dom
+        raise RuntimeError("；".join(errors) or "未找到 Edge / Chrome")
+
+    @staticmethod
+    def extract_json(dom: str):
+        m = re.search(r"<pre[^>]*>(.*?)</pre>", dom, re.S | re.I)
+        if m:
+            text = html_mod.unescape(m.group(1))
+        else:  # 例如 Edge 的 JSON 查看器：去掉标签后再找 JSON
+            body = re.search(r"<body[^>]*>(.*)</body>", dom, re.S | re.I)
+            text = html_mod.unescape(re.sub(r"<[^>]+>", "", body.group(1) if body else dom))
+        s, e = text.find("{"), text.rfind("}")
+        if s == -1 or e <= s:
+            raise ValueError("浏览器返回的内容里没有 JSON")
+        return json.loads(text[s:e + 1])
+
+
+class _TextResponse:
+    """让浏览器抓到的内容拥有和 requests.Response 一样的 .json() / .text。"""
+
+    status_code = 200
+
+    def __init__(self, text: str, data):
+        self.text = text
+        self._data = data
+
+    def json(self):
+        return self._data
+
+    def raise_for_status(self) -> None:
+        return None
+
+
 # ─────────────────────────────── Steam 接口 ────────────────────────────────
 
 class SteamClient:
@@ -209,10 +331,10 @@ class SteamClient:
     APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"
     REVIEWS_URL = "https://store.steampowered.com/appreviews/{appid}"
 
-    PROXY_MODES = ("自动", "直连", "系统代理", "自定义")
+    PROXY_MODES = ("自动", "直连", "系统代理", "自定义", "浏览器")
 
     def __init__(self, cc: str = "cn", lang: str = "schinese", proxy_mode: str = "自动",
-                 proxy_url: str = "", timeout=(8, 25)):
+                 proxy_url: str = "", preferred_route: str = "", timeout=(8, 25)):
         self.cc = cc
         self.lang = lang
         self.timeout = timeout
@@ -231,19 +353,24 @@ class SteamClient:
             "mature_content": "1",
             "Steam_Language": lang,
         })
-        self._candidates = self._build_routes(proxy_mode, proxy_url)
+        self.browser = BrowserFetcher()
+        self._candidates = self._build_routes(proxy_mode, proxy_url, preferred_route)
         self._route_idx = 0
         self._route_locked = False
         self.route_desc = self._candidates[0][0]
 
-    @staticmethod
-    def _build_routes(mode: str, custom: str) -> list[tuple[str, dict]]:
-        """返回 [(线路名称, proxies字典), …]，按尝试顺序排列。"""
-        direct = ("直连", {})
+    @property
+    def route_kind(self) -> str:
+        return self._candidates[self._route_idx][1]
+
+    def _build_routes(self, mode: str, custom: str, preferred: str) -> list[tuple[str, str, dict]]:
+        """返回 [(线路名称, 类型 http|browser, proxies), …]，按尝试顺序排列。"""
+        direct = ("直连", "http", {})
         sys_p = system_proxies()
-        sys_route = (f"系统代理 {sys_p.get('https', '')}", sys_p) if sys_p else None
+        sys_route = (f"系统代理 {sys_p.get('https', '')}", "http", sys_p) if sys_p else None
         cu = normalize_proxy(custom)
-        custom_route = (f"代理 {cu}", {"http": cu, "https": cu}) if cu else None
+        custom_route = (f"代理 {cu}", "http", {"http": cu, "https": cu}) if cu else None
+        browser_route = ("浏览器 (Edge/Chrome)", "browser", {}) if self.browser.available else None
 
         if mode == "直连":
             return [direct]
@@ -251,11 +378,18 @@ class SteamClient:
             return [sys_route] if sys_route else [direct]
         if mode == "自定义":
             return [custom_route] if custom_route else [direct]
-        # 自动：直连 → 系统代理 → 自定义代理，去重
+        if mode == "浏览器":
+            return [browser_route] if browser_route else [("浏览器（未找到 Edge/Chrome）", "browser", {})]
+        # 自动：直连 → 系统代理 → 自定义代理 → 浏览器；上次成功的线路提到最前
         routes = [direct]
-        for r in (sys_route, custom_route):
-            if r and all(r[1] != x[1] for x in routes):
+        for r in (sys_route, custom_route, browser_route):
+            if r and all(r[2] != x[2] or r[1] != x[1] for x in routes):
                 routes.append(r)
+        if preferred:
+            for i, r in enumerate(routes):
+                if r[0] == preferred:
+                    routes.insert(0, routes.pop(i))
+                    break
         return routes
 
     def _get(self, url: str, params: dict | None = None, retries: int = 2) -> requests.Response:
@@ -266,21 +400,30 @@ class SteamClient:
             routes = list(enumerate(self._candidates))[self._route_idx:]
 
         errors: list[str] = []
-        for idx, (desc, proxies) in routes:
+        for idx, (desc, kind, proxies) in routes:
             last_err: Exception | None = None
-            for attempt in range(retries):
+            attempts = 1 if kind == "browser" else retries
+            for attempt in range(attempts):
                 try:
-                    r = self.session.get(url, params=params, timeout=self.timeout, proxies=proxies)
-                    if r.status_code == 429:
-                        last_err = RuntimeError("HTTP 429（请求过于频繁，已自动等待）")
-                        time.sleep(5 * (attempt + 1))
-                        continue
-                    r.raise_for_status()
+                    if kind == "browser":
+                        if not self.browser.available:
+                            raise RuntimeError("未找到 Edge / Chrome")
+                        full_url = requests.Request("GET", url, params=params).prepare().url
+                        dom = self.browser.fetch_dom(full_url)
+                        r = _TextResponse(dom, BrowserFetcher.extract_json(dom))
+                    else:
+                        r = self.session.get(url, params=params, timeout=self.timeout, proxies=proxies)
+                        if r.status_code == 429:
+                            last_err = RuntimeError("HTTP 429（请求过于频繁，已自动等待）")
+                            time.sleep(5 * (attempt + 1))
+                            continue
+                        r.raise_for_status()
                     self._route_idx, self._route_locked, self.route_desc = idx, True, desc
-                    return r
-                except requests.RequestException as e:
+                    return r  # type: ignore[return-value]
+                except (requests.RequestException, RuntimeError, ValueError) as e:
                     last_err = e
-                    time.sleep(1.0 * (attempt + 1))
+                    if kind != "browser":
+                        time.sleep(1.0 * (attempt + 1))
             errors.append(f"{desc}：{short_error(last_err) if last_err else '未知错误'}")
         raise RuntimeError("\n".join(errors))
 
@@ -548,7 +691,7 @@ class App(tk.Tk):
         ent_proxy = ttk.Entry(sb2, textvariable=self.var_proxy_url, width=24)
         ent_proxy.pack(side="left", padx=(4, 0))
         ent_proxy.bind("<Return>", lambda e: self.refresh())
-        ttk.Label(sb2, text="例如 127.0.0.1:7890（开着加速器/VPN 时填它的 HTTP 端口）",
+        ttk.Label(sb2, text="开着加速器时：把加速器切到「路由模式」，或网络选「浏览器」（借 Edge/Chrome 抓取）",
                   foreground="#888888").pack(side="left", padx=(6, 0))
 
         # ── 过滤栏 ──
@@ -673,7 +816,8 @@ class App(tk.Tk):
         self._stop.clear()
         client = SteamClient(cc=self.var_cc.get() or "cn",
                              proxy_mode=self.var_proxy_mode.get() or "自动",
-                             proxy_url=self.var_proxy_url.get())
+                             proxy_url=self.var_proxy_url.get(),
+                             preferred_route=self.state_data["settings"].get("last_route", ""))
         self.client = client
         self.btn_refresh.configure(state="disabled")
         self.btn_stop.configure(state="normal")
@@ -731,10 +875,10 @@ class App(tk.Tk):
                     "扫描失败",
                     "无法连接 Steam 商店，已尝试的线路：\n" + tried + "\n\n"
                     "建议：\n"
-                    "1. 开着加速器 / VPN 时，把它的 HTTP 代理端口填到「代理地址」\n"
-                    "   （常见：127.0.0.1:7890、7897、10809），网络选「自定义」后再扫描。\n"
-                    "2. 很多游戏加速器只加速游戏、不代理网页：可开启加速器的「浏览器/系统代理」模式，\n"
-                    "   或先关掉加速器，网络选「直连」试试。",
+                    "1. 用雷神 / UU 等游戏加速器：它们的「进程模式」只给 Steam 和浏览器加速。\n"
+                    "   在加速器设置里把加速模式改成「路由模式」再重新加速；\n"
+                    "   或者把本程序的网络选「浏览器」，借 Edge/Chrome 抓取数据。\n"
+                    "2. 用 VPN / 代理软件：把它的 HTTP 端口填到「代理地址」（如 127.0.0.1:7890），网络选「自定义」。",
                 )
             self._schedule_auto()
             return
@@ -764,6 +908,8 @@ class App(tk.Tk):
                 pass
         self.seen = pruned
         self.state_data["seen"] = self.seen
+        if self.client:
+            self.state_data.setdefault("settings", {})["last_route"] = self.client.route_desc
         save_state(self.state_data)
 
         self.items = results or []
@@ -1013,6 +1159,9 @@ class App(tk.Tk):
         appid, url = it["appid"], it["header_image"]
         if not url:
             return
+        if self.client and self.client.route_kind == "browser" and appid not in self._img_cache:
+            self.img_label.configure(text="浏览器线路下不加载封面")
+            return
         if appid in self._img_cache:
             self._set_photo(self._img_cache[appid])
             return
@@ -1137,6 +1286,7 @@ class App(tk.Tk):
 
     def _on_close(self) -> None:
         self.state_data["settings"] = {
+            "last_route": self.state_data.get("settings", {}).get("last_route", ""),
             "cc": self.var_cc.get(), "auto": self.var_auto.get(),
             "interval": self._int(self.var_interval, 30), "popup": self.var_popup.get(),
             "group": self.var_group.get(),
